@@ -27,8 +27,8 @@ This React application loads GPS data from CSV files, filters by datetime, and d
 1. Clone the repository or download the project files:
 
 ```bash
-git clone git@github.com:yourusername/your-repo-name.git
-cd your-repo-name
+git clone git@github.com:mf1999/GPSViewApp.git
+cd GPSViewApp
 
 2. Install dependencies:
 
