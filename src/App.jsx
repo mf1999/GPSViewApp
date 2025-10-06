@@ -1,3 +1,4 @@
+// App.jsx
 import React, { useState, useEffect, useMemo } from 'react';
 import Papa from 'papaparse';
 import { MapContainer, TileLayer, Polyline } from 'react-leaflet';
@@ -13,6 +14,45 @@ const DEVICE_COLORS = {
   device2: 'red',
 };
 
+/* ---------- helpers ---------- */
+
+// meters between two lat/lon points (haversine)
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371008.8;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// Split into segments when gaps are large (time or spatial jump)
+function segmentByGap(points, { maxTimeGapMs = 5 * 60 * 1000, maxJumpMeters = 200 } = {}) {
+  if (!points || points.length === 0) return [];
+  const segs = [];
+  let cur = [points[0]];
+
+  for (let i = 1; i < points.length; i++) {
+    const prev = points[i - 1];
+    const curr = points[i];
+    const dt = curr.datetime - prev.datetime; // ms
+    const d = haversineMeters(prev.lat, prev.lon, curr.lat, curr.lon);
+
+    // break if a large time gap or a large jump
+    if (dt > maxTimeGapMs || d > maxJumpMeters || !isFinite(d)) {
+      if (cur.length >= 2) segs.push(cur);
+      cur = [curr];
+    } else {
+      cur.push(curr);
+    }
+  }
+  if (cur.length >= 2) segs.push(cur);
+  return segs;
+}
+
+// Parse CSV -> [{lat, lon, datetime}], sorted by datetime, filtered for validity
 function parseCsv(device, file, setFullDeviceData) {
   Papa.parse(file, {
     download: true,
@@ -21,18 +61,23 @@ function parseCsv(device, file, setFullDeviceData) {
     complete: (result) => {
       const parsed = result.data
         .map((row) => {
-          const lat = parseFloat(row.latitude?.trim());
-          const lon = parseFloat(row.longitude?.trim());
-          const dt = new Date(row.datetime?.trim());
+          const lat = parseFloat(row.latitude?.trim?.() ?? row.latitude);
+          const lon = parseFloat(row.longitude?.trim?.() ?? row.longitude);
+          const dtStr = row.datetime?.trim?.() ?? row.datetime;
+          const dt = new Date(dtStr);
           return { lat, lon, datetime: dt };
         })
         .filter(
           (p) =>
-            !isNaN(p.lat) &&
-            !isNaN(p.lon) &&
+            Number.isFinite(p.lat) &&
+            Number.isFinite(p.lon) &&
             p.datetime instanceof Date &&
-            !isNaN(p.datetime.getTime())
+            !Number.isNaN(p.datetime.getTime())
         );
+
+      // ensure chronological order
+      parsed.sort((a, b) => a.datetime - b.datetime);
+
       setFullDeviceData((old) => ({ ...old, [device]: parsed }));
     },
     error: (err) => {
@@ -40,6 +85,8 @@ function parseCsv(device, file, setFullDeviceData) {
     },
   });
 }
+
+/* ---------- app ---------- */
 
 export default function App() {
   // full data per device from CSV
@@ -98,7 +145,17 @@ export default function App() {
 
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
-      <div style={{ padding: '10px', background: '#eee', display: 'flex', gap: '20px', alignItems: 'center' }}>
+      {/* Controls */}
+      <div
+        style={{
+          padding: '10px',
+          background: '#eee',
+          display: 'flex',
+          gap: '20px',
+          alignItems: 'center',
+          flexWrap: 'wrap',
+        }}
+      >
         <div>
           <label>
             Start datetime:{' '}
@@ -136,32 +193,33 @@ export default function App() {
         </div>
       </div>
 
-      <MapContainer
-        center={mapCenter}
-        zoom={13}
-        style={{ flexGrow: 1, width: '100%', height: '100%' }}
-      >
-        <TileLayer
-          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-          attribution="&copy; OpenStreetMap contributors"
-        />
+      {/* Map */}
+      <MapContainer center={mapCenter} zoom={13} style={{ flexGrow: 1, width: '100%', height: '100%' }}>
+        <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="&copy; OpenStreetMap contributors" />
+
         {Object.entries(filteredDeviceData).map(([device, coords]) => {
-  const latlngs = coords
-  .filter(({ lat, lon }) => !isNaN(lat) && !isNaN(lon))
-  .map(({ lat, lon }) => [lat, lon]);
+          const clean = coords.filter(({ lat, lon }) => Number.isFinite(lat) && Number.isFinite(lon));
 
-  console.log(`Device: ${device}`);
-  console.log('Last 3–4 drawn coords:', latlngs.slice(-4));
+          // break into segments to avoid straight lines across gaps/teleports
+          const segments = segmentByGap(clean, {
+            maxTimeGapMs: 5 * 60 * 1000, // 5 minutes
+            maxJumpMeters: 200, // tune as needed
+          });
 
-  return (
-    <Polyline
-      key={device}
-      positions={latlngs}
-      color={DEVICE_COLORS[device]}
-      weight={3}
-    />
-  );
-})}
+          if (segments.length === 0) return null;
+
+          return segments.map((seg, idx) => {
+            const latlngs = seg.map(({ lat, lon }) => [lat, lon]);
+            return (
+              <Polyline
+                key={`${device}-${idx}`}
+                positions={latlngs}
+                color={DEVICE_COLORS[device]}
+                weight={3}
+              />
+            );
+          });
+        })}
       </MapContainer>
     </div>
   );
