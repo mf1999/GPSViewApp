@@ -1,4 +1,4 @@
-// src/App.jsx — GPS + AIS CSV viewer with timestamp filtering + AUTOPLAY
+// src/App.jsx — GPS + AIS CSV viewer with timestamp filtering + AUTOPLAY + LOOP
 // GPS CSV columns:   sec,nanosec,latitude,longitude,datetime
 // AIS CSV columns:   mmsi,latitude,longitude,header_sec,header_nanosec,bag_name
 import React, { useEffect, useMemo, useRef, useState } from 'react';
@@ -43,12 +43,7 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-/**
- * Convert a point's time to milliseconds since epoch (number) for filtering/segmenting/rendering.
- * We store/sec/nsec as numbers to avoid BigInt → Number precision issues:
- *   ms = t_sec * 1000 + t_nsec / 1e6
- * Fallback to parsing 't' (datetime string) if t_sec/t_nsec are not present.
- */
+/** Convert a point's time to ms since epoch for filtering/segmenting/rendering. */
 function pointTimeMs(p) {
   if (Number.isFinite(p.t_sec)) {
     return p.t_sec * 1000 + (Number.isFinite(p.t_nsec) ? p.t_nsec / 1e6 : 0);
@@ -60,7 +55,7 @@ function pointTimeMs(p) {
   return Number.isFinite(ms) ? ms : NaN;
 }
 
-// Split into segments when there are big temporal or spatial gaps
+// Split into segments when big temporal or spatial gaps
 function segmentByGap(points, { maxTimeGapMs = 5 * 60 * 1000, maxJumpMeters = 200 } = {}) {
   if (!points || points.length < 2) return [];
   const segs = [];
@@ -118,15 +113,15 @@ export default function App() {
   const [filterStartMs, setFilterStartMs] = useState(NaN);
   const [filterEndMs, setFilterEndMs] = useState(NaN);
 
-  // --- AUTOPLAY state ---
+  // AUTOPLAY state
   const [isPlaying, setIsPlaying] = useState(false);
-  const [playSpeed, setPlaySpeed] = useState(1); // 1x .. 10x
-  const [currentTimeMs, setCurrentTimeMs] = useState(NaN); // progresses from filterStartMs → filterEndMs
+  const [playSpeed, setPlaySpeed] = useState(1); // 1..10
+  const [loopPlayback, setLoopPlayback] = useState(true);
+  const [currentTimeMs, setCurrentTimeMs] = useState(NaN);
   const rafRef = useRef(null);
   const lastTickRef = useRef(null);
 
   // ---------- GPS CSV loader ----------
-  // Expected: sec,nanosec,latitude,longitude,datetime
   function parseGpsCsv(input, explicitDevice) {
     const isUrl = typeof input === 'string';
     Papa.parse(input, {
@@ -143,7 +138,7 @@ export default function App() {
           const lon = toFloat(row.longitude);
           const sec = toInt(row.sec);
           const nsec = toInt(row.nanosec);
-          const datetimeRaw = row.datetime; // preserved as-is
+          const datetimeRaw = row.datetime;
 
           if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
 
@@ -152,9 +147,8 @@ export default function App() {
             String(row.device ?? row.id ?? row.Device ?? '').trim() ||
             'device';
 
-          // Store sec/nsec (numbers) to avoid BigInt precision issues
-          let t_sec = Number.isFinite(sec) ? sec : undefined;
-          let t_nsec = Number.isFinite(nsec) ? nsec : undefined;
+          const t_sec = Number.isFinite(sec) ? sec : undefined;
+          const t_nsec = Number.isFinite(nsec) ? nsec : undefined;
 
           const pt =
             Number.isFinite(t_sec)
@@ -165,7 +159,6 @@ export default function App() {
           tmp.get(device).push(pt);
         }
 
-        // sort ascending by time
         for (const [k, arr] of tmp) {
           arr.sort((a, b) => pointTimeMs(a) - pointTimeMs(b));
         }
@@ -176,7 +169,6 @@ export default function App() {
   }
 
   // ---------- AIS CSV loader ----------
-  // Expected: mmsi,latitude,longitude,header_sec,header_nanosec,bag_name
   function parseAisCsv(input) {
     const isUrl = typeof input === 'string';
     Papa.parse(input, {
@@ -198,7 +190,7 @@ export default function App() {
 
           if (!mmsi || !Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(sec)) continue;
 
-          const t_sec = sec;             // numbers
+          const t_sec = sec;
           const t_nsec = Number.isFinite(nsec) ? nsec : 0;
 
           const pt = { lat, lon, t_sec, t_nsec, bag, raw: row };
@@ -245,9 +237,12 @@ export default function App() {
     return { min: Math.min(...times), max: Math.max(...times) };
   }, [gpsByDevice, aisByMmsi]);
 
-  const filterActive = Number.isFinite(filterStartMs) && Number.isFinite(filterEndMs) && filterEndMs >= filterStartMs;
+  const filterActive =
+    Number.isFinite(filterStartMs) &&
+    Number.isFinite(filterEndMs) &&
+    filterEndMs >= filterStartMs;
 
-  // If user changes filter while playing, clamp current time
+  // Clamp current time when filter changes
   useEffect(() => {
     if (!filterActive) {
       setIsPlaying(false);
@@ -320,7 +315,6 @@ export default function App() {
       })),
     [gpsForRender]
   );
-
   const aisLegend = useMemo(
     () =>
       Array.from(aisForRender.keys()).map((mmsi) => ({
@@ -331,7 +325,7 @@ export default function App() {
     [aisForRender]
   );
 
-  // ---------- AUTOPLAY loop ----------
+  // ---------- AUTOPLAY loop (with optional looping) ----------
   useEffect(() => {
     if (!playingActive) {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -346,15 +340,22 @@ export default function App() {
         rafRef.current = requestAnimationFrame(tick);
         return;
       }
-      const dtRealMs = ts - lastTickRef.current; // real elapsed ms between frames
+      const dtRealMs = ts - lastTickRef.current;
       lastTickRef.current = ts;
 
       setCurrentTimeMs((prev) => {
-        const next = prev + dtRealMs * playSpeed;
-        if (next >= filterEndMs) {
-          // stop at end
-          setIsPlaying(false);
-          return filterEndMs;
+        const range = Math.max(0, filterEndMs - filterStartMs);
+        let next = prev + dtRealMs * playSpeed;
+
+        if (next > filterEndMs) {
+          if (loopPlayback && range > 0) {
+            // modulo wrap while preserving overflow
+            const over = (next - filterStartMs) % range;
+            return filterStartMs + over;
+          } else {
+            setIsPlaying(false);
+            return filterEndMs;
+          }
         }
         return next;
       });
@@ -368,7 +369,7 @@ export default function App() {
       rafRef.current = null;
       lastTickRef.current = null;
     };
-  }, [playingActive, playSpeed, filterEndMs]);
+  }, [playingActive, playSpeed, filterStartMs, filterEndMs, loopPlayback]);
 
   // ---------- Render ----------
   return (
@@ -446,7 +447,14 @@ export default function App() {
           >
             Use Data Range
           </button>
-          <button onClick={() => { setFilterStartMs(NaN); setFilterEndMs(NaN); setIsPlaying(false); setCurrentTimeMs(NaN); }}>
+          <button
+            onClick={() => {
+              setFilterStartMs(NaN);
+              setFilterEndMs(NaN);
+              setIsPlaying(false);
+              setCurrentTimeMs(NaN);
+            }}
+          >
             Clear
           </button>
         </div>
@@ -457,9 +465,7 @@ export default function App() {
           <button
             onClick={() => {
               if (!filterActive) return;
-              if (!Number.isFinite(currentTimeMs)) {
-                setCurrentTimeMs(filterStartMs);
-              }
+              if (!Number.isFinite(currentTimeMs)) setCurrentTimeMs(filterStartMs);
               setIsPlaying((p) => !p);
             }}
             disabled={!filterActive}
@@ -487,9 +493,16 @@ export default function App() {
               step="1"
               value={playSpeed}
               onChange={(e) => setPlaySpeed(parseInt(e.target.value, 10))}
-              style={{ verticalAlign: 'middle' }}
             />
             <span>{playSpeed}×</span>
+          </label>
+          <label style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+            Loop
+            <input
+              type="checkbox"
+              checked={loopPlayback}
+              onChange={(e) => setLoopPlayback(e.target.checked)}
+            />
           </label>
           {filterActive && Number.isFinite(currentTimeMs) && (
             <span style={{ opacity: 0.75 }}>
@@ -532,7 +545,6 @@ export default function App() {
                       </Polyline>
                     );
                   })}
-                  {/* current point marker (last point) */}
                   {pts.length > 0 && (
                     <CircleMarker
                       center={[pts[pts.length - 1].lat, pts[pts.length - 1].lon]}
@@ -544,7 +556,7 @@ export default function App() {
               );
             })}
 
-          {/* AIS tracks (grouped by MMSI) */}
+          {/* AIS tracks (per MMSI) */}
           {showAIS &&
             Array.from(aisForRender.entries()).map(([mmsi, pts]) => {
               if (hiddenMmsi.has(mmsi) || !pts?.length) return null;
@@ -564,7 +576,6 @@ export default function App() {
                       </div>
                     </Tooltip>
                   </Polyline>
-                  {/* current point marker (last point) */}
                   {pts.length > 0 && (
                     <CircleMarker
                       center={[pts[pts.length - 1].lat, pts[pts.length - 1].lon]}
